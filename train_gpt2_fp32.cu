@@ -1,3 +1,4 @@
+#define USE_SOFTPLUS
 /*
 GPT-2 Transformer Neural Net trained in raw CUDA
 Non-trivial notes to be aware of:
@@ -238,6 +239,38 @@ __device__ float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
+
+/// RELU 1
+
+__global__ void softplus_forward_kernel(float* out, const float* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float beta = 1.0f;
+    float threshold = 20.0f;
+    if (idx < N * T) {
+        float x = inp[idx];
+        // If the input is large enough, avoid computing log(1 + exp(beta * x)) to prevent overflow.
+        if (x * beta > threshold) {
+            out[idx] = x;
+        } else {
+            out[idx] = (1.0f / beta) * log1pf(expf(beta * x));  // Softplus function
+        }
+    }
+}
+
+__global__ void relu_forward_kernel(float* out, const float* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * T) {
+        out[idx] = fmaxf(0.0f, inp[idx]);  // ReLU activation
+    }
+}
+
+__global__ void sparse_relu_forward_kernel(float* out, const float* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * T && inp[idx] != 0.0f) {
+        out[idx] = fmaxf(0.0f, inp[idx]);  // Only calculate for non-zero entries
+    }
+}
+
 __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
     // inp, out shape: (N, T, T), where N = B * NH
     // fuses the multiplication by scale inside attention
@@ -441,6 +474,35 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         atomicAdd(&dbias[i], dbias_shared[i]);
         atomicAdd(&dweight[i], dweight_shared[i]);
 	}
+}
+
+// Relu 2
+
+__global__ void softplus_backward_kernel(float* dinp, const float* dout, const float* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float beta = 1.0;
+    if (idx < N * T) {
+        float x = inp[idx];
+        float sigmoid = 1.0f / (1.0f + expf(-beta * x));  // Sigmoid function
+        dinp[idx] = dout[idx] * sigmoid;
+    }
+}
+
+
+__global__ void relu_backward_kernel(float* dinp, const float* dout, const float* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * T) {
+        // Gradient for ReLU: pass through the gradient where inp > 0, else zero
+        dinp[idx] = (inp[idx] > 0.0f) ? dout[idx] : 0.0f;
+    }
+}
+
+
+__global__ void sparse_relu_backward_kernel(float* dinp, const float* dout, const float* inp, int N, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * T && inp[idx] != 0.0f) {
+        dinp[idx] = (inp[idx] > 0.0f) ? dout[idx] : 0.0f;  // Backpropagate only for non-zero entries
+    }
 }
 
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
@@ -764,10 +826,19 @@ void attention_forward(float* out, float* qkvr, float* att,
     float* preatt = inp;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
 
+    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
+#ifdef USE_RELU
+    relu_forward_kernel<<<grid_size, softmax_block_size>>>(att, preatt, B * NH, T);
+#elif defined(USE_RELU_SPARSE)
+    sparse_relu_forward_kernel<<<grid_size, softmax_block_size>>>(att, preatt, B * NH, T);
+#elif defined(USE_SOFTPLUS)
+    softplus_forward_kernel<<<grid_size, softmax_block_size>>>(att, preatt, B * NH, T);
+#else
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
-    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+#endif
+
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
@@ -860,9 +931,17 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into dv
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, scratch, HS, T * HS, att, T, T * T, &zero, dv, HS, T * HS, B * NH));
     // backward into preatt
+#ifdef USE_RELU
+    relu_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B * NH, T);
+#elif defined(USE_RELU_SPARSE)
+    sparse_relu_backward_kernel <<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B * NH, T);
+#elif defined(USE_SOFTPLUS)
+    softplus_backward_kernel <<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B * NH, T);
+#else
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
     softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
+#endif
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
@@ -1592,6 +1671,15 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
     printf("| Parameter             | Value                                              |\n");
     printf("+-----------------------+----------------------------------------------------+\n");
+#ifdef USE_RELU
+    printf("| softmax activation    | %-50s |\n", "ReLU");
+#elif defined(USE_RELU_SPARSE)
+    printf("| softmax activation    | %-50s |\n", "SparseReLU");
+#elif defined(USE_SOFTPLUS)
+    printf("| softmax activation    | %-50s |\n", "SoftPlus");
+#else
+    printf("| softmax activation    | %-50s |\n", "Softmax");
+#endif
     printf("| train data pattern    | %-50s |\n", train_data_pattern);
     printf("| val data pattern      | %-50s |\n", val_data_pattern);
     printf("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
